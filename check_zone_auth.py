@@ -108,7 +108,7 @@ def get_delegation(zone_name):
 
         for ref in ref_list:
             for addr in refs[ref]:
-                ans_pkt = do_query(qmsg, addr, timeout=3)
+                ans_pkt = do_query(qmsg, addr)
                 if ans_pkt:
                     break
 
@@ -171,14 +171,14 @@ def get_info_from_nameservers(zone_name,refs):
                 pass
             ret_data[ns][address] = {}
             for tries in range(5):
-                ret_data[ns][address]['SOA'] = do_query(soa_qmsg, address, timeout=5)
+                ret_data[ns][address]['SOA'] = do_query(soa_qmsg, address)
                 if ret_data[ns][address]['SOA']:
                     if get_reply_type(ret_data[ns][address]['SOA']) == 'ANSWER':
                         break
                 if tries > 4:
                     unknown('Could not get SOA record from %s at %s' % (ns, address))
             for tries in range(5):
-                ret_data[ns][address]['NS'] = do_query(ns_qmsg, address, timeout=5)
+                ret_data[ns][address]['NS'] = do_query(ns_qmsg, address)
                 if ret_data[ns][address]['NS']:
                     break
                 if tries > 4:
