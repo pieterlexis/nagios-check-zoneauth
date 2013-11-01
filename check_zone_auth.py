@@ -36,14 +36,28 @@ def sanitize_name(name):
 
 def IP_version(address):
     try:
-        v4 = socket.inet_pton(socket.AF_INET,ipaddr)
+        v4 = socket.inet_pton(socket.AF_INET,address)
         return 4
     except:
         try:
-            v6 = socket.inet_pton(socket.AF_INET6,ipaddr)
+            v6 = socket.inet_pton(socket.AF_INET6,address)
             return 6
         except:
             return 0
+
+def do_query(qmsg, address, timeout=5):
+    ip_version = IP_version(address)
+    if ip_version == 6 and not ip6:
+        return False
+    if ip_version == 4 and not ip4:
+        return False
+    try:
+        return dns.query.udp(qmsg, address, timeout=timeout)
+    except socket.error as error_msg:
+        # If the error is "[Errno 101] Network is unreachable", there is no
+        # ip_version connectivity, disable it for the rest of the run
+        if error_msg == "[Errno 101] Network is unreachable":
+            eval("ip%s = False" % ip_version)
 
 def get_reply_type(msg):
     """ Returns the reply type of the message
@@ -60,13 +74,9 @@ def get_reply_type(msg):
             return 'NODATA'
 
     if not len(msg.answer) and len(msg.authority):
-        has_ns = False
         for auth_rrset in msg.authority:
             if auth_rrset.rdtype == dns.rdatatype.NS:
-                has_ns = True
-                break
-        if has_ns:
-            return 'REFERRAL'
+                return 'REFERRAL'
 
     # A little sketchy, but if the message is nothing of the above,
     # we'll label it as an answer
@@ -98,7 +108,7 @@ def get_delegation(zone_name):
 
         for ref in ref_list:
             for addr in refs[ref]:
-                ans_pkt = dns.query.udp(qmsg, addr, timeout=3)
+                ans_pkt = do_query(qmsg, addr, timeout=3)
                 if ans_pkt:
                     break
 
@@ -150,7 +160,6 @@ def check_delegation(zone_name,data,expected_ns_list=None):
         for addr in data[nameserver]:
             print data[nameserver][addr]['SOA'].serial
 
-
 def get_info_from_nameservers(zone_name,refs):
     soa_qmsg = dns.message.make_query(zone_name, dns.rdatatype.SOA)
     ns_qmsg = dns.message.make_query(zone_name, dns.rdatatype.NS)
@@ -158,21 +167,26 @@ def get_info_from_nameservers(zone_name,refs):
     for ns in refs:
         ret_data[ns] = {}
         for address in refs[ns]:
+            if IP_version(address) == 6 and not ip6:
+                pass
             ret_data[ns][address] = {}
             for tries in range(5):
-                ret_data[ns][address]['SOA'] = dns.query.udp(soa_qmsg, address, timeout=5)
+                ret_data[ns][address]['SOA'] = do_query(soa_qmsg, address, timeout=5)
                 if ret_data[ns][address]['SOA']:
                     if get_reply_type(ret_data[ns][address]['SOA']) == 'ANSWER':
                         break
                 if tries > 4:
                     unknown('Could not get SOA record from %s at %s' % (ns, address))
             for tries in range(5):
-                ret_data[ns][address]['NS'] = dns.query.udp(ns_qmsg, address, timeout=5)
+                ret_data[ns][address]['NS'] = do_query(ns_qmsg, address, timeout=5)
                 if ret_data[ns][address]['NS']:
                     break
                 if tries > 4:
                     unknown('Could not get NS records from %s at %s' % (ns, address))
     return ret_data
+
+ip4 = True
+ip6 = True
 
 zone_name = 'non-existing-domain.kumina.nl'
 zone_name = 'ec2.kumina.nl'
