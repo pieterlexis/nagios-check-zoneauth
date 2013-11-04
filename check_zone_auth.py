@@ -45,19 +45,33 @@ def IP_version(address):
         except:
             return 0
 
-def do_query(qmsg, address, timeout=5):
+def do_query(qmsg, address, timeout=5, tries=5):
     ip_version = IP_version(address)
-    if ip_version == 6 and not ip6:
-        return False
+    global ip4
+    global ip6
     if ip_version == 4 and not ip4:
         return False
-    try:
-        return dns.query.udp(qmsg, address, timeout=timeout)
-    except socket.error as error_msg:
-        # If the error is "[Errno 101] Network is unreachable", there is no
-        # ip_version connectivity, disable it for the rest of the run
-        if error_msg == "[Errno 101] Network is unreachable":
-            eval("ip%s = False" % ip_version)
+    if ip_version == 6 and not ip6:
+        return False
+    for attempt in range(tries):
+        try:
+            return dns.query.udp(qmsg, address, timeout=timeout)
+        except socket.error as error_msg:
+            # If the error is "[Errno 101] Network is unreachable", there is no
+            # ip_version connectivity, disable it for the rest of the run
+            if str(error_msg) == '[Errno 101] Network is unreachable':
+                # TODO use eval() for this
+                if ip_version == 4:
+                    ip4 = False
+                    return False
+                if ip_version == 6:
+                    ip6 = False
+                    return False
+            else:
+                raise
+        except dns.exception.Timeout:
+            if attempt == tries:
+                raise
 
 def get_reply_type(msg):
     """ Returns the reply type of the message
@@ -158,31 +172,40 @@ def check_delegation(zone_name,data,expected_ns_list=None):
         wanted_nameservers = expected_ns_list
     for nameserver in data:
         for addr in data[nameserver]:
-            print data[nameserver][addr]['SOA'].serial
+            print data[nameserver][addr]
 
 def get_info_from_nameservers(zone_name,refs):
     soa_qmsg = dns.message.make_query(zone_name, dns.rdatatype.SOA)
     ns_qmsg = dns.message.make_query(zone_name, dns.rdatatype.NS)
     ret_data = {}
+
     for ns in refs:
         ret_data[ns] = {}
+        global ip4
+        global ip6
         for address in refs[ns]:
+            if IP_version(address) == 4 and not ip4:
+                continue
             if IP_version(address) == 6 and not ip6:
-                pass
+                continue
+
             ret_data[ns][address] = {}
-            for tries in range(5):
-                ret_data[ns][address]['SOA'] = do_query(soa_qmsg, address)
-                if ret_data[ns][address]['SOA']:
-                    if get_reply_type(ret_data[ns][address]['SOA']) == 'ANSWER':
-                        break
-                if tries > 4:
+            ret_data[ns][address]['SOA'] = do_query(soa_qmsg, address)
+            if ret_data[ns][address]['SOA']:
+                if get_reply_type(ret_data[ns][address]['SOA']) != 'ANSWER':
                     unknown('Could not get SOA record from %s at %s' % (ns, address))
-            for tries in range(5):
-                ret_data[ns][address]['NS'] = do_query(ns_qmsg, address)
-                if ret_data[ns][address]['NS']:
-                    break
-                if tries > 4:
+            else:
+                # we got False, so the AF was probably not supported
+                del ret_data[ns][address]
+                continue
+            ret_data[ns][address]['NS'] = do_query(ns_qmsg, address)
+            if ret_data[ns][address]['NS']:
+                if get_reply_type(ret_data[ns][address]['NS']) != 'ANSWER':
                     unknown('Could not get NS records from %s at %s' % (ns, address))
+            else:
+                # we got False, so the AF was probably not supported
+                del ret_data[ns][address]
+                continue
     return ret_data
 
 ip4 = True
@@ -205,7 +228,9 @@ if len(from_upstream):
 else:
     unknown("No nameservers found, is %s a zone?" % zone_name)
 
-# TODO
+# TODO in order of importance
 # - IPv4/IPv6 selection
 # - debug output
 # - Expected ns RRSets
+# - TCP fallback + EDNS buffers
+# - DNSSEC support
