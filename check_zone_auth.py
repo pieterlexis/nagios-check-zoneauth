@@ -96,7 +96,8 @@ def get_reply_type(msg):
     # we'll label it as an answer
     return 'ANSWER'
 
-def get_delegation(zone_name):
+def get_delegation():
+    global zone_name
     # let's have the root-servers as initial glue :)
     refs = {
         'A.ROOT-SERVERS.NET.': ['198.41.0.4', '2001:503:BA3E::2:30'],
@@ -167,7 +168,8 @@ def get_delegation(zone_name):
 def is_same(items, field=False):
     return all(x == items[0] for x in items)
 
-def check_delegation(zone_name,data,expected_ns_list=None):
+def check_delegation(data,expected_ns_list=None):
+    global zone_name
     # First, check if all nameservers return the same data
     for nameserver in data:
         soa_list = []
@@ -184,13 +186,12 @@ def check_delegation(zone_name,data,expected_ns_list=None):
 
             for answer in data[nameserver][addr]['NS'].answer:
                 if not str(answer.name) == zone_name:
-                    critical("Name on NS record returned by %s on %s is not the zone name (%s vs %s)" % (nameserver, addr, answer.name, zone_name))
+                    critical("Name on NS record returned by %s on %s is not the zone name (%s vs %s)"
+                            % (nameserver, addr, answer.name, zone_name))
             ns_list.append(data[nameserver][addr]['NS'].answer)
 
     if is_same(soa_list) and is_same(ns_list):
-        if not expected_ns_list:
-           ok("OK" % (zone_name))
-        else:
+        if expected_ns_list:
             # check the NS records against the list of wanted nameservers
             for nameserver in data:
                 for addr in data[nameserver]:
@@ -201,14 +202,38 @@ def check_delegation(zone_name,data,expected_ns_list=None):
                         for ns in ans.to_text().split("\n"):
                             comp_list.append(ns.split(' ')[4])
                         if sorted(comp_list) != sorted(expected_ns_list):
-                            critical('Got unexpected NS records, expected %s, got %s from %s at %s' % (','.join(sorted(expected_ns_list)), ','.join(sorted(comp_list)), nameserver, addr))
-            # If we're here, we got the correct nameservers.
-            ok('got %s as nameservers' % ','.join(sorted(comp_list)))
+                            critical('Got unexpected NS records, expected %s, got %s from %s at %s'
+                                    % (','.join(sorted(expected_ns_list)),
+                                        ','.join(sorted(comp_list)), nameserver,
+                                        addr))
+        # If we're here, we got the correct nameservers.
+        ok('got %s as nameservers' % ','.join(sorted(comp_list)))
     else:
-        # Shit is wrong.... find out what
-        pass
+        if not is_same(soa_list):
+            ns_name = []
+            ns_addr = []
+            soa_ns = []
+            soa_serial = []
+            for nameserver in data:
+                for addr in data[nameserver]:
+                    ns_name.append(nameserver)
+                    ns_addr.append(addr)
+                    soa_serial.append(int(data[nameserver][addr]['SOA'].answer[0].to_text().split(' ')[6]))
+                    soa_ns.append(data[nameserver][addr]['SOA'].answer[0].to_text().split(' ')[4])
+            if not is_same(soa_serial):
+                warning('serials in SOA don\'t match. Got %s' % ', '.join(['%s (%s): %s'
+                    % (ns_name[i], ns_addr[i], soa_serial[i]) for i in
+                    range(len(ns_name))]))
+            if not is_same(soa_ns):
+                warning('primary nameservers in SOA don\'t match. Got %s' % ', '.join(['%s (%s): %s'
+                    % (ns_name[i], ns_addr[i], soa_ns[i]) for i in
+                    range(len(ns_name))]))
 
-def get_info_from_nameservers(zone_name,refs):
+        if not is_same(ns_list):
+            pass
+
+def get_info_from_nameservers(refs):
+    global zone_name
     soa_qmsg = dns.message.make_query(zone_name, dns.rdatatype.SOA)
     ns_qmsg = dns.message.make_query(zone_name, dns.rdatatype.NS)
     global ip4
@@ -254,7 +279,7 @@ zone_name = 'ec2.kumina.nl'
 zone_name = 'kumina.nl'
 expected = ['ns3.kumina.nl.', 'ns4.kumina.nl.']
 zone_name = sanitize_name(zone_name)
-from_upstream = get_delegation(zone_name)
+from_upstream = get_delegation()
 
 if len(from_upstream):
     if len(from_upstream) == 1:
@@ -263,10 +288,11 @@ if len(from_upstream):
     # We got referrals
     if expected:
         if not sorted(from_upstream.keys()) == sorted(expected):
-            critical('Got unexpected nameservers from upstream: expected %s, got %s' % (','.join(sorted(expected)), ','.join(from_upstream.keys())))
+            critical('Got unexpected nameservers from upstream: expected %s, got %s'
+                    % (','.join(sorted(expected)), ','.join(from_upstream.keys())))
 
-    data = get_info_from_nameservers(zone_name, from_upstream)
-    check_delegation(zone_name, data, expected)
+    data = get_info_from_nameservers(from_upstream)
+    check_delegation(data, expected)
 else:
     unknown("No nameservers found, is %s a zone?" % zone_name)
 
