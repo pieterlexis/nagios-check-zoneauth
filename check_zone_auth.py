@@ -171,18 +171,24 @@ def check_delegation(zone_name,data,expected_ns_list=None):
     if expected_ns_list:
         wanted_nameservers = expected_ns_list
     for nameserver in data:
+        ######
+        for x in result.data.raw:
+            ret.append(dns.rdata.from_wire(result.qclass, result.qtype, x, 0, len(x)))
+        ###
+
         for addr in data[nameserver]:
-            print data[nameserver][addr]
+            soa_record = dns.rdtypes.ANY.SOA.
+            print 
 
 def get_info_from_nameservers(zone_name,refs):
     soa_qmsg = dns.message.make_query(zone_name, dns.rdatatype.SOA)
     ns_qmsg = dns.message.make_query(zone_name, dns.rdatatype.NS)
+    global ip4
+    global ip6
     ret_data = {}
 
     for ns in refs:
         ret_data[ns] = {}
-        global ip4
-        global ip6
         for address in refs[ns]:
             if IP_version(address) == 4 and not ip4:
                 continue
@@ -223,7 +229,6 @@ if len(from_upstream):
         warning('only one authoritative nameserver')
     # We got referrals
     data = get_info_from_nameservers(zone_name, from_upstream)
-    print data
     check_delegation(zone_name, data)
 else:
     unknown("No nameservers found, is %s a zone?" % zone_name)
