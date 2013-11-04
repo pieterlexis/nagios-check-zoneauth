@@ -152,7 +152,7 @@ def get_delegation():
                 # Go to the next iteration
                 continue
             else:
-                raise error('We got a referral without glue :(')
+                unknown('Got a referral without glue')
 
         elif reply_type == 'ANSWER':
             # we reached the correct nameserver. This happens when the
