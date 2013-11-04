@@ -164,21 +164,49 @@ def get_delegation(zone_name):
             # zonename is most-likely not a zone
             return {}
 
-def check_delegation(zone_name,data,expected_ns_list=None):
-    max_serial = 0
-    nscount = 0
-    wanted_nameservers = []
-    if expected_ns_list:
-        wanted_nameservers = expected_ns_list
-    for nameserver in data:
-        ######
-        for x in result.data.raw:
-            ret.append(dns.rdata.from_wire(result.qclass, result.qtype, x, 0, len(x)))
-        ###
+def is_same(items, field=False):
+    return all(x == items[0] for x in items)
 
+def check_delegation(zone_name,data,expected_ns_list=None):
+    # First, check if all nameservers return the same data
+    for nameserver in data:
+        soa_list = []
+        ns_list = []
         for addr in data[nameserver]:
-            soa_record = dns.rdtypes.ANY.SOA.
-            print 
+            # Check if the data is for the correct name
+            if len(data[nameserver][addr]['SOA'].answer) > 1:
+                critical("Nameserver %s on %s returned more than one answer on a SOA query" % (nameserver, addr))
+
+            for answer in data[nameserver][addr]['SOA'].answer:
+                if not str(answer.name) == zone_name:
+                    critical("Name on SOA record returned by %s on %s is not the zone name (%s vs %s)" % (nameserver, addr, answer.name, zone_name))
+            soa_list.append(data[nameserver][addr]['SOA'].answer)
+
+            for answer in data[nameserver][addr]['NS'].answer:
+                if not str(answer.name) == zone_name:
+                    critical("Name on NS record returned by %s on %s is not the zone name (%s vs %s)" % (nameserver, addr, answer.name, zone_name))
+            ns_list.append(data[nameserver][addr]['NS'].answer)
+
+    if is_same(soa_list) and is_same(ns_list):
+        if not expected_ns_list:
+           ok("OK" % (zone_name))
+        else:
+            # check the NS records against the list of wanted nameservers
+            for nameserver in data:
+                for addr in data[nameserver]:
+                    for ans in data[nameserver][addr]['NS'].answer:
+                        comp_list = []
+                        if ans.rdtype != 2:
+                            continue
+                        for ns in ans.to_text().split("\n"):
+                            comp_list.append(ns.split(' ')[4])
+                        if sorted(comp_list) != sorted(expected_ns_list):
+                            critical('Got unexpected NS records, expected %s, got %s from %s at %s' % (','.join(sorted(expected_ns_list)), ','.join(sorted(comp_list)), nameserver, addr))
+            # If we're here, we got the correct nameservers.
+            ok('got %s as nameservers' % ','.join(sorted(comp_list)))
+    else:
+        # Shit is wrong.... find out what
+        pass
 
 def get_info_from_nameservers(zone_name,refs):
     soa_qmsg = dns.message.make_query(zone_name, dns.rdatatype.SOA)
@@ -212,24 +240,33 @@ def get_info_from_nameservers(zone_name,refs):
                 # we got False, so the AF was probably not supported
                 del ret_data[ns][address]
                 continue
+        if ret_data[ns] == {}:
+            del ret_data[ns]
     return ret_data
 
 ip4 = True
 ip6 = True
 
+# TODO: argparse
+#       make the expected set 'safe'
 zone_name = 'non-existing-domain.kumina.nl'
 zone_name = 'ec2.kumina.nl'
 zone_name = 'kumina.nl'
+expected = ['ns3.kumina.nl.', 'ns4.kumina.nl.']
 zone_name = sanitize_name(zone_name)
 from_upstream = get_delegation(zone_name)
 
 if len(from_upstream):
     if len(from_upstream) == 1:
         # Only one auth is delegated... that is not the right way
-        warning('only one authoritative nameserver')
+        warning('only one authoritative nameserver from upstream: %s' % from_upstream.keys())
     # We got referrals
+    if expected:
+        if not sorted(from_upstream.keys()) == sorted(expected):
+            critical('Got unexpected nameservers from upstream: expected %s, got %s' % (','.join(sorted(expected)), ','.join(from_upstream.keys())))
+
     data = get_info_from_nameservers(zone_name, from_upstream)
-    check_delegation(zone_name, data)
+    check_delegation(zone_name, data, expected)
 else:
     unknown("No nameservers found, is %s a zone?" % zone_name)
 
