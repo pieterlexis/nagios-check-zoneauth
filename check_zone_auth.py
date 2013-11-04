@@ -1,30 +1,28 @@
 #!/usr/bin/env python
 
+import argparse
 import dns.message
 import dns.query
 import dns.rcode
 import dns.rdatatype
+import dns.resolver
 import random
 import socket
 import sys
 
 def ok(msg):
-    global zone_name
     print "ZONE %s OK: %s" % (zone_name, msg)
     sys.exit(0)
 
 def critical(msg):
-    global zone_name
     print "ZONE %s CRITAL: %s" % (zone_name, msg)
     sys.exit(1)
 
 def warning(msg):
-    global zone_name
     print "ZONE %s WARNING: %s" % (zone_name, msg)
     sys.exit(2)
 
 def unknown(msg):
-    global zone_name
     print "ZONE %s UNKNOWN: %s" % (zone_name, msg)
     sys.exit(3)
 
@@ -45,26 +43,48 @@ def IP_version(address):
         except:
             return 0
 
+def get_addresses(name):
+    ret = []
+    try:
+        ret += [str(x) for x in dns.resolver.query(name, 'A',
+            raise_on_no_answer=False).rrset]
+        ret += [str(x) for x in dns.resolver.query(name, 'AAAA',
+            raise_on_no_answer=False).rrset]
+    except:
+        pass
+    return ret
+
 def do_query(qmsg, address, timeout=5, tries=5):
-    ip_version = IP_version(address)
     global ip4
     global ip6
+    ip_version = IP_version(address)
     if ip_version == 4 and not ip4:
         return False
     if ip_version == 6 and not ip6:
         return False
+
     for attempt in range(tries):
         try:
-            return dns.query.udp(qmsg, address, timeout=timeout)
+            ans = dns.query.udp(qmsg, address, timeout=timeout)
+            if debug or verbose:
+                if verbose:
+                    print 'Got reply from %s' % (address)
+                else:
+                    print 'Got answer from %s: \n%s' % (address, ans)
+            return ans
         except socket.error as error_msg:
             # If the error is "[Errno 101] Network is unreachable", there is no
             # ip_version connectivity, disable it for the rest of the run
             if str(error_msg) == '[Errno 101] Network is unreachable':
                 # TODO use eval() for this
                 if ip_version == 4:
+                    if debug or verbose:
+                        print 'Disabeling IPv4'
                     ip4 = False
                     return False
                 if ip_version == 6:
+                    if debug or verbose:
+                        print 'Disabeling IPv6'
                     ip6 = False
                     return False
             else:
@@ -97,7 +117,6 @@ def get_reply_type(msg):
     return 'ANSWER'
 
 def get_delegation():
-    global zone_name
     # let's have the root-servers as initial glue :)
     refs = {
         'A.ROOT-SERVERS.NET.': ['198.41.0.4', '2001:503:BA3E::2:30'],
@@ -117,18 +136,32 @@ def get_delegation():
 
     qmsg = dns.message.make_query(zone_name, dns.rdatatype.SOA)
 
+    if debug or verbose:
+        print 'Starting to iterate to get the delegation'
+
     while True:
         ans_pkt = None
         ref_list = random.sample(refs, len(refs))
 
-        while not ans_pkt:
-            for ref in ref_list:
-                for addr in refs[ref]:
-                    ans_pkt = do_query(qmsg, addr)
+        for ref in ref_list:
+            if refs[ref] == []:
+                # No referral additional data was sent, do a forward lookup
+                # using the system resolver
+                refs[ref] = get_addresses(ref)
+            for addr in refs[ref]:
+                if debug or verbose:
+                    print 'Selected %s(%s) for query' % (ref, addr)
+                ans_pkt = do_query(qmsg, addr)
+                if ans_pkt:
+                    break
+            if ans_pkt:
+                break
 
         # Check if the answer-packet is
         # a referral, an answer or NODATA
         reply_type = get_reply_type(ans_pkt)
+        if debug or verbose:
+            print 'Got a %s' % reply_type
         if reply_type == 'REFERRAL':
             # We got a referral from the upstream nameserver
             final_ref = False
@@ -138,14 +171,21 @@ def get_delegation():
                     for ns in rrset:
                         refs[str(ns)] = []
                     if str(rrset.name) == zone_name:
+                        if debug or verbose:
+                            print '- This is the final referral'
                         final_ref = True
             for rrset in ans_pkt.additional:
                 # hopefully we got some glue :)
                 if rrset.rdtype == dns.rdatatype.AAAA or rrset.rdtype == dns.rdatatype.A:
                     for glue in rrset:
                         refs[str(rrset.name)].append(str(glue))
+            if debug or verbose:
+                print 'Got the following referrals:\n%s' % refs
 
             if final_ref:
+                for ref in refs:
+                    if refs[ref] == []:
+                        refs[ref] = get_addresses(ref)
                 return refs
             if len(refs):
                 # Go to the next iteration
@@ -168,7 +208,6 @@ def is_same(items, field=False):
     return all(x == items[0] for x in items)
 
 def check_delegation(data,expected_ns_list=None):
-    global zone_name
     name_list = []
     addr_list = []
     soa_rec_list = []
@@ -222,11 +261,8 @@ def check_delegation(data,expected_ns_list=None):
                     range(len(name_list))]))
 
 def get_info_from_nameservers(refs):
-    global zone_name
     soa_qmsg = dns.message.make_query(zone_name, dns.rdatatype.SOA)
     ns_qmsg = dns.message.make_query(zone_name, dns.rdatatype.NS)
-    global ip4
-    global ip6
     ret_data = {}
 
     for ns in refs:
@@ -236,6 +272,9 @@ def get_info_from_nameservers(refs):
                 continue
             if IP_version(address) == 6 and not ip6:
                 continue
+
+            if debug or verbose:
+                print 'Getting SOA and NS info from %s on %s' % (ns, address)
 
             ret_data[ns][address] = {}
             ret_data[ns][address]['SOA'] = do_query(soa_qmsg, address)
@@ -258,18 +297,38 @@ def get_info_from_nameservers(refs):
             del ret_data[ns]
     return ret_data
 
+parser = argparse.ArgumentParser(description='Check for delegation and zone-consistancy')
+parser.add_argument('zone', help='Zone to check', metavar='ZONE')
+parser.add_argument('-6', action='store_true', dest='ip6_only')
+parser.add_argument('-4', action='store_true', dest='ip4_only')
+parser.add_argument('--nameservers', '-n', help='A comma-separated list of expected nameservers')
+parser.add_argument('--verbose', '-v', help='Be a little verbose',
+        action='store_true')
+parser.add_argument('--debug', '-d', help='Output debugging information',
+        action='store_true')
+args = parser.parse_args()
+
+zone_name = sanitize_name(args.zone)
+debug = args.debug
+verbose = args.verbose
+
+if args.ip4_only and args.ip6_only:
+    unknown("Please use either -4, -6 or none, not both")
+
 ip4 = True
 ip6 = True
 
-# TODO: argparse
-#       make the expected set 'safe'
-zone_name = 'non-existing-domain.kumina.nl'
-zone_name = 'ec2.kumina.nl'
-zone_name = 'kumina.nl'
-expected = ['ns3.kumina.nl.', 'ns4.kumina.nl.']
-zone_name = sanitize_name(zone_name)
-from_upstream = get_delegation()
+if args.ip4_only:
+    ip6 = False
+if args.ip6_only:
+    ip4 = False
 
+if args.nameservers:
+    expected = [ sanitize_name(x) for x in args.nameservers.split(',') ]
+else:
+    expected = False
+
+from_upstream = get_delegation()
 if len(from_upstream):
     if len(from_upstream) == 1:
         # Only one auth is delegated... that is not the right way
@@ -287,8 +346,5 @@ else:
     unknown("No nameservers found, is %s a zone?" % zone_name)
 
 # TODO in order of importance
-# - IPv4/IPv6 selection
-# - debug output
-# - Expected ns RRSets
 # - TCP fallback + EDNS buffers
 # - DNSSEC support
