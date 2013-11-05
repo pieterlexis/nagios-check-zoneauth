@@ -402,6 +402,7 @@ if len(from_upstream):
 else:
     unknown("No nameservers found, is %s a zone?" % zone_name)
 
-# TODO in order of importance
+# TODO
+# - Write tests
 # - TCP fallback + EDNS buffers
 # - DNSSEC support
