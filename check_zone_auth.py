@@ -349,11 +349,6 @@ def get_info_from_nameservers(refs):
                 del ret_data[ns][address]
                 continue
 
-            if get_reply_type(ret_data[ns][address]['SOA']) != 'ANSWER':
-                unknown('No SOA record returned from %s(%s)' % (ns, address))
-            if get_reply_type(ret_data[ns][address]['NS']) != 'ANSWER':
-                unknown('No NS records returned from %s(%s)' % (ns, address))
-
         if ret_data[ns] == {}:
             del ret_data[ns]
 
