@@ -9,13 +9,28 @@ import dns.resolver
 import random
 import socket
 import sys
+import time
 
+# Some exceptions that might be thrown during the run of this script
+class NotAuthAnswerException(Exception):
+    pass
+
+class AddressFamilyNotSupportedException(Exception):
+    pass
+
+class NoAnswerException(Exception):
+    pass
+
+class AddressFamilyUnknownException(Exception):
+    pass
+
+# Functions that exit the program with the correct exit-codes
 def ok(msg):
     print "ZONE %s OK: %s" % (zone_name, msg)
     sys.exit(0)
 
 def critical(msg):
-    print "ZONE %s CRITAL: %s" % (zone_name, msg)
+    print "ZONE %s CRITICAL: %s" % (zone_name, msg)
     sys.exit(1)
 
 def warning(msg):
@@ -27,12 +42,14 @@ def unknown(msg):
     sys.exit(3)
 
 def sanitize_name(name):
+    # Take the name and append a '.' at the end if there isn't any
     if name[-1] == '.':
         return name
     else:
         return '%s.' % name
 
 def IP_version(address):
+    # Return the address family
     try:
         v4 = socket.inet_pton(socket.AF_INET,address)
         return 4
@@ -41,9 +58,10 @@ def IP_version(address):
             v6 = socket.inet_pton(socket.AF_INET6,address)
             return 6
         except:
-            return 0
+            raise AddressFamilyUnknownException(address)
 
 def get_addresses(name):
+    # Use the system resolver to get address info
     ret = []
     try:
         ret += [str(x) for x in dns.resolver.query(name, 'A',
@@ -54,13 +72,21 @@ def get_addresses(name):
         pass
     return ret
 
-def do_query(qmsg, address, timeout=5, tries=5):
+def do_query(qmsg, address, timeout=5, tries=5,
+        raise_on_bad_address_family=False):
     global ip4
     global ip6
+    if not ip6 and not ip4:
+        raise Exception('There is no address family available')
+
     ip_version = IP_version(address)
     if ip_version == 4 and not ip4:
+        if raise_on_bad_address_family:
+            raise AddressFamilyNotSupportedException
         return False
     if ip_version == 6 and not ip6:
+        if raise_on_bad_address_family:
+            raise AddressFamilyNotSupportedException
         return False
 
     for attempt in range(tries):
@@ -81,22 +107,23 @@ def do_query(qmsg, address, timeout=5, tries=5):
                     if debug or verbose:
                         print 'Disabeling IPv4'
                     ip4 = False
-                    return False
                 if ip_version == 6:
                     if debug or verbose:
                         print 'Disabeling IPv6'
                     ip6 = False
+                if raise_on_bad_address_family:
+                    raise AddressFamilyNotSupportedException
+                else:
                     return False
             else:
                 raise
         except dns.exception.Timeout:
             if attempt == tries:
                 raise
+            time.sleep(1)
 
 def get_reply_type(msg):
-    """ Returns the reply type of the message
-    Code and return values taken from ldns"""
-
+    # Returns the reply type of the message. Code and return values taken from ldns
     if not isinstance(msg, dns.message.Message):
         return 'UNKNOWN'
 
@@ -117,6 +144,9 @@ def get_reply_type(msg):
     return 'ANSWER'
 
 def get_delegation():
+    # This function iterates from the root to the final authoritative
+    # nameservers using (where possible) the glue it gets.
+
     # let's have the root-servers as initial glue :)
     refs = {
         'A.ROOT-SERVERS.NET.': ['198.41.0.4', '2001:503:BA3E::2:30'],
@@ -135,6 +165,7 @@ def get_delegation():
     }
 
     qmsg = dns.message.make_query(zone_name, dns.rdatatype.SOA)
+    qmsg.flags = 0
 
     if debug or verbose:
         print 'Starting to iterate to get the delegation'
@@ -161,7 +192,7 @@ def get_delegation():
         # a referral, an answer or NODATA
         reply_type = get_reply_type(ans_pkt)
         if debug or verbose:
-            print 'Got a %s' % reply_type
+            print 'Got a %s reply' % reply_type
         if reply_type == 'REFERRAL':
             # We got a referral from the upstream nameserver
             final_ref = False
@@ -187,6 +218,7 @@ def get_delegation():
                     if refs[ref] == []:
                         refs[ref] = get_addresses(ref)
                 return refs
+
             if len(refs):
                 # Go to the next iteration
                 continue
@@ -205,9 +237,11 @@ def get_delegation():
             return {}
 
 def is_same(items, field=False):
+    # Returns true if all items are the same
     return all(x == items[0] for x in items)
 
-def check_delegation(data,expected_ns_list=None):
+def check_delegation(data, from_upstream, expected_ns_list=None):
+    # Various checks to see if the delegation is correct
     name_list = []
     addr_list = []
     soa_rec_list = []
@@ -215,6 +249,7 @@ def check_delegation(data,expected_ns_list=None):
     soa_ns_list = []
     ns_rec_list = []
 
+    # Fill the lists with all the data we need to compare them later on
     for nameserver in data:
         for addr in data[nameserver]:
             name_list.append(nameserver)
@@ -240,29 +275,52 @@ def check_delegation(data,expected_ns_list=None):
                                 % (','.join(sorted(expected_ns_list)),
                                     ','.join(sorted(ns_recs)), nameserver, addr))
 
-    if is_same(soa_rec_list) and is_same(ns_rec_list):
-        # If we're here, we got the correct nameservers.
-        ok('got %s as nameservers' % ','.join(sorted(ns_rec_list[0])))
+            ns_dict = {}
+            for addition in data[nameserver][addr]['NS'].additional:
+                if str(addition.name) not in ns_dict:
+                    ns_dict[str(addition.name)] = []
 
-    else:
-        if not is_same(soa_serial_list):
-            warning('serials in SOA don\'t match. Got %s' % ', '.join(['%s (%s): %s'
-                % (name_list[i], addr_list[i], soa_serial_list[i]) for i in
+                for addition_address in [rdata.split(' ')[4] for rdata in
+                addition.to_text().split('\n')]:
+                    ns_dict[str(addition.name)].append(addition_address)
+
+            if sorted(from_upstream) != sorted(ns_dict):
+                warning('Addresses of nameservers on %s(%s) don\'t match upstream glue (%s vs %s)'
+                    % (nameserver, addr, from_upstream, ns_dict))
+
+    if not is_same(soa_serial_list):
+        warning('serials in SOA don\'t match. Got %s' % ', '.join(['%s (%s): %s'
+            % (name_list[i], addr_list[i], soa_serial_list[i]) for i in
+            range(len(name_list))]))
+
+    if not is_same(soa_ns_list):
+        warning('primary nameservers in SOA don\'t match. Got %s' % ', '.join(['%s (%s): %s'
+            % (name_list[i], addr_list[i], soa_ns_list[i]) for i in
+            range(len(name_list))]))
+
+    if not is_same(ns_rec_list):
+        warning('Mis-matched NS records. Got %s' % ', '.join(['%s (%s): %s'
+            % (name_list[i], addr_list[i], ns_rec_list[i]) for i in
                 range(len(name_list))]))
 
-        if not is_same(soa_ns_list):
-            warning('primary nameservers in SOA don\'t match. Got %s' % ', '.join(['%s (%s): %s'
-                % (name_list[i], addr_list[i], soa_ns_list[i]) for i in
-                range(len(name_list))]))
+    # If we're here, we got the correct nameservers.
+    ok('got %s as nameservers' % ','.join(sorted(ns_rec_list[0])))
 
-        if not is_same(ns_rec_list):
-            warning('Mis-matched NS records. Got %s' % ', '.join(['%s (%s): %s'
-                % (name_list[i], addr_list[i], ns_rec_list[i]) for i in
-                    range(len(name_list))]))
+def get_auth_data(rdtype, address):
+    msg = dns.message.make_query(zone_name, eval('dns.rdatatype.%s' % rdtype))
+    msg.flags = 0
+
+    ret = do_query(msg, address, raise_on_bad_address_family=True)
+
+    if 'AA' not in dns.flags.to_text(ret.flags):
+        raise NotAuthAnswerException([rdtype, address])
+
+    if get_reply_type(ret) != 'ANSWER':
+        raise NoAnswerException([rdtype, address])
+
+    return ret
 
 def get_info_from_nameservers(refs):
-    soa_qmsg = dns.message.make_query(zone_name, dns.rdatatype.SOA)
-    ns_qmsg = dns.message.make_query(zone_name, dns.rdatatype.NS)
     ret_data = {}
 
     for ns in refs:
@@ -277,24 +335,28 @@ def get_info_from_nameservers(refs):
                 print 'Getting SOA and NS info from %s on %s' % (ns, address)
 
             ret_data[ns][address] = {}
-            ret_data[ns][address]['SOA'] = do_query(soa_qmsg, address)
-            if ret_data[ns][address]['SOA']:
-                if get_reply_type(ret_data[ns][address]['SOA']) != 'ANSWER':
-                    unknown('Could not get SOA record from %s at %s' % (ns, address))
-            else:
-                # we got False, so the AF was probably not supported
+            try:
+                ret_data[ns][address]['SOA'] = get_auth_data('SOA', address)
+                ret_data[ns][address]['NS'] = get_auth_data('NS', address)
+            except NotAuthAnswerException as e:
+                critical('Got non-AA answer for %s from %s(%s)' % (e[0][0], ns,
+                    address))
+            except NoAnswerException as e:
+                unknown('No %s records returned from %s(%s)' % (e[0], ns,
+                    address))
+            except AddressFamilyNotSupportedException:
+                # Remove this entry from the dict, as we can never get the data.
                 del ret_data[ns][address]
                 continue
-            ret_data[ns][address]['NS'] = do_query(ns_qmsg, address)
-            if ret_data[ns][address]['NS']:
-                if get_reply_type(ret_data[ns][address]['NS']) != 'ANSWER':
-                    unknown('Could not get NS records from %s at %s' % (ns, address))
-            else:
-                # we got False, so the AF was probably not supported
-                del ret_data[ns][address]
-                continue
+
+            if get_reply_type(ret_data[ns][address]['SOA']) != 'ANSWER':
+                unknown('No SOA record returned from %s(%s)' % (ns, address))
+            if get_reply_type(ret_data[ns][address]['NS']) != 'ANSWER':
+                unknown('No NS records returned from %s(%s)' % (ns, address))
+
         if ret_data[ns] == {}:
             del ret_data[ns]
+
     return ret_data
 
 parser = argparse.ArgumentParser(description='Check for delegation and zone-consistancy')
@@ -340,7 +402,7 @@ if len(from_upstream):
                     % (', '.join(sorted(expected)), ', '.join(from_upstream.keys())))
 
     data = get_info_from_nameservers(from_upstream)
-    check_delegation(data, expected)
+    check_delegation(data, from_upstream, expected)
 
 else:
     unknown("No nameservers found, is %s a zone?" % zone_name)
