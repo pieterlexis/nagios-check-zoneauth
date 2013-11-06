@@ -62,14 +62,23 @@ def IP_version(address):
 
 def get_addresses(name):
     # Use the system resolver to get address info
+    global ip6
+    global ip4
     ret = []
     try:
-        ret += [str(x) for x in dns.resolver.query(name, 'A',
-            raise_on_no_answer=False).rrset]
-        ret += [str(x) for x in dns.resolver.query(name, 'AAAA',
-            raise_on_no_answer=False).rrset]
+        if ip4:
+            ret += [str(x) for x in dns.resolver.query(name, 'A',
+                raise_on_no_answer=False).rrset]
     except:
         pass
+
+    try:
+        if ip6:
+            ret += [str(x) for x in dns.resolver.query(name, 'AAAA',
+                raise_on_no_answer=False).rrset]
+    except:
+        pass
+
     return ret
 
 def do_query(qmsg, address, timeout=5, tries=5,
