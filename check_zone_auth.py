@@ -13,8 +13,8 @@ try:
     import dns.rdatatype
     import dns.resolver
 except ImportError:
-    sys.stderr.write('Unable to load DNSPython, is it installed and in'
-                     'PYTHONPATH?')
+    sys.stderr.write('Unable to load DNSPython, is it installed and in '
+                     'PYTHONPATH?\n')
     sys.exit(3)
 
 
