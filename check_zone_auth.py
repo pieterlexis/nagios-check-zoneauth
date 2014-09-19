@@ -1,15 +1,22 @@
 #!/usr/bin/env python
 
 import argparse
-import dns.message
-import dns.query
-import dns.rcode
-import dns.rdatatype
-import dns.resolver
 import random
 import socket
 import sys
 import time
+
+try:
+    import dns.message
+    import dns.query
+    import dns.rcode
+    import dns.rdatatype
+    import dns.resolver
+except ImportError:
+    sys.stderr.write('Unable to load DNSPython, is it installed and in'
+                     'PYTHONPATH?')
+    sys.exit(3)
+
 
 # Some exceptions that might be thrown during the run of this script
 class NotAuthAnswerException(Exception):
