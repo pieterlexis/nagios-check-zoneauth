@@ -1,5 +1,6 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
+from __future__ import print_function
 import argparse
 import random
 import socket
@@ -37,22 +38,22 @@ class AddressFamilyUnknownException(Exception):
 
 # Functions that exit the program with the correct exit-codes
 def ok(msg):
-    print "ZONE %s OK: %s" % (zone_name, msg)
+    print("ZONE %s OK: %s" % (zone_name, msg))
     sys.exit(0)
 
 
 def critical(msg):
-    print "ZONE %s CRITICAL: %s" % (zone_name, msg)
+    print("ZONE %s CRITICAL: %s" % (zone_name, msg))
     sys.exit(1)
 
 
 def warning(msg):
-    print "ZONE %s WARNING: %s" % (zone_name, msg)
+    print("ZONE %s WARNING: %s" % (zone_name, msg))
     sys.exit(2)
 
 
 def unknown(msg):
-    print "ZONE %s UNKNOWN: %s" % (zone_name, msg)
+    print("ZONE %s UNKNOWN: %s" % (zone_name, msg))
     sys.exit(3)
 
 
@@ -121,9 +122,9 @@ def do_query(qmsg, address, timeout=5, tries=5,
             ans = dns.query.udp(qmsg, address, timeout=timeout)
             if debug or verbose:
                 if verbose:
-                    print 'Got reply from %s' % (address)
+                    print('Got reply from %s' % (address))
                 else:
-                    print 'Got answer from %s: \n%s' % (address, ans)
+                    print('Got answer from %s: \n%s' % (address, ans))
             return ans
         except socket.error as error_msg:
             # If the error is "[Errno 101] Network is unreachable", there is no
@@ -132,11 +133,11 @@ def do_query(qmsg, address, timeout=5, tries=5,
                 # TODO use eval() for this
                 if ip_version == 4:
                     if debug or verbose:
-                        print 'Disabeling IPv4'
+                        print('Disabeling IPv4')
                     ip4 = False
                 if ip_version == 6:
                     if debug or verbose:
-                        print 'Disabeling IPv6'
+                        print('Disabeling IPv6')
                     ip6 = False
                 if raise_on_bad_address_family:
                     raise AddressFamilyNotSupportedException
@@ -200,7 +201,7 @@ def get_delegation():
     qmsg.flags = 0
 
     if debug or verbose:
-        print 'Starting to iterate to get the delegation'
+        print('Starting to iterate to get the delegation')
 
     while True:
         ans_pkt = None
@@ -213,7 +214,7 @@ def get_delegation():
                 refs[ref] = get_addresses(ref)
             for addr in refs[ref]:
                 if debug or verbose:
-                    print 'Selected %s(%s) for query' % (ref, addr)
+                    print('Selected %s(%s) for query' % (ref, addr))
                 ans_pkt = do_query(qmsg, addr)
                 if ans_pkt:
                     break
@@ -224,7 +225,7 @@ def get_delegation():
         # a referral, an answer or NODATA
         reply_type = get_reply_type(ans_pkt)
         if debug or verbose:
-            print 'Got a %s reply' % reply_type
+            print('Got a %s reply' % reply_type)
         if reply_type == 'REFERRAL':
             # We got a referral from the upstream nameserver
             final_ref = False
@@ -235,7 +236,7 @@ def get_delegation():
                         refs[str(ns)] = []
                     if str(rrset.name) == zone_name:
                         if debug or verbose:
-                            print '- This is the final referral'
+                            print('- This is the final referral')
                         final_ref = True
             for rrset in ans_pkt.additional:
                 # hopefully we got some glue :)
@@ -244,7 +245,7 @@ def get_delegation():
                     for glue in rrset:
                         refs[str(rrset.name)].append(str(glue))
             if debug or verbose:
-                print 'Got the following referrals:\n%s' % refs
+                print('Got the following referrals:\n%s' % refs)
 
             if final_ref:
                 for ref in refs:
@@ -382,7 +383,7 @@ def get_info_from_nameservers(refs):
                 continue
 
             if debug or verbose:
-                print 'Getting SOA and NS info from %s on %s' % (ns, address)
+                print('Getting SOA and NS info from %s on %s' % (ns, address))
 
             ret_data[ns][address] = {}
             try:
