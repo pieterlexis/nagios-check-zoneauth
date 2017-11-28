@@ -1,463 +1,357 @@
 #!/usr/bin/env python3
 
 from __future__ import print_function
+from builtins import super
 import argparse
-import random
-import socket
-import sys
+import dns.message
+import dns.query
+import dns.rcode
+import dns.rdatatype
+import dns.resolver
+import dns.dnssec
 import time
+import socket
+import logging
+import nagiosplugin
 
-try:
-    import dns.message
-    import dns.query
-    import dns.rcode
-    import dns.rdatatype
-    import dns.resolver
-except ImportError:
-    sys.stderr.write('Unable to load DNSPython, is it installed and in '
-                     'PYTHONPATH?\n')
-    sys.exit(3)
+_log = logging.getLogger('nagiosplugin')
 
 
-# Some exceptions that might be thrown during the run of this script
-class NotAuthAnswerException(Exception):
-    pass
+class CheckResolver(dns.resolver.Resolver):
+    def __init__(self, filename='/etc/resolv.conf', configure=True, do_ipv6=False):
+        super().__init__(filename, configure)
+        self.cache = dns.resolver.LRUCache()
+        self.edns = 0
+        self.ednsflags = dns.flags.DO
+        self.flags = dns.flags.CD + dns.flags.RD
 
+    def get_parent_ns(self, qname):
+        """
 
-class AddressFamilyNotSupportedException(Exception):
-    pass
+        :param dns.name.Name qname:
+        :return:
+        """
+        if not isinstance(qname, dns.name.Name):
+            raise ValueError('qname is not a dns.name.Name')
+        _log.info('Attempting to get the NSSet for the parent of {}'.format(qname))
+        name = qname
+        while True:
+            try:
+                name = name.parent()
+            except dns.name.NoParent:
+                break
+            try:
+                _log.info('Finding out if {} is the parent of {}'.format(name, qname))
+                resp = self.query(name, dns.rdatatype.NS, raise_on_no_answer=False)  # type: dns.resolver.Answer
+            except dns.resolver.NXDOMAIN:
+                _log.info('Got NXDomain for {}'.format(name))
+                continue
+            if resp is not None:
+                _log.debug('Got a response: {}'.format(resp.response))
+                for rrset in resp.response.answer:
+                    if rrset.rdtype == dns.rdatatype.NS and rrset.name == name:
+                        return [elem.target for elem in rrset.items]
+        raise dns.resolver.NoAnswer('No NS records found for {} or any of its parents'.format(qname))
 
+    def get_addrs(self, qname):
+        if not isinstance(qname, dns.name.Name):
+            raise ValueError('qname is not a dns.name.Name')
+        _log.info('Attempting to retrieve IP addresses for {}'.format(qname))
+        ret = {}
+        for addr_type in ['A', 'AAAA']:
+            _log.info('Doing a query for {}|{}'.format(qname, addr_type))
+            res = self.query(qname, addr_type, raise_on_no_answer=False)  # type: dns.resolver.Answer
+            _log.debug('Got a response: {}'.format(res.response))
+            for rrset in res.response.answer:
+                if rrset.rdtype == dns.rdatatype.from_text(addr_type) and rrset.name == qname:
+                    ret[addr_type] = [elem.address for elem in rrset.items]
+        return ret
 
-class NoAnswerException(Exception):
-    pass
+    def get_delegation_ns_from(self, qname, nameserver, tcp=False, source=None, raise_on_no_answer=True, source_port=0):
+        _log.info('Attempting to get the delegation NSSet for {} from {}'.format(qname, nameserver))
+        res = self.do_query_at_ip(qname, nameserver, tcp, source, raise_on_no_answer, source_port)
+        _log.debug('Got a response: {}'.format(res))
 
+        for rrset in res.authority:
+            if rrset.rdtype == dns.rdatatype.NS and rrset.name == qname:
+                return [elem.target for elem in rrset.items]
 
-class AddressFamilyUnknownException(Exception):
-    pass
+    def get_ns_from(self, qname, nameserver, tcp=False, source=None, raise_on_no_answer=True, source_port=0):
+        _log.info('Attempting to get the authoritative NSSet for {} from {}'.format(qname, nameserver))
+        res = self.do_query_at_ip(qname, nameserver, tcp, source, raise_on_no_answer, source_port)
+        _log.debug('Got a response: {}'.format(res))
 
+        for rrset in res.answer:
+            if rrset.rdtype == dns.rdatatype.NS and rrset.name == qname:
+                return [elem.target for elem in rrset.items]
 
-# Functions that exit the program with the correct exit-codes
-def ok(msg):
-    print("ZONE %s OK: %s" % (zone_name, msg))
-    sys.exit(0)
-
-
-def critical(msg):
-    print("ZONE %s CRITICAL: %s" % (zone_name, msg))
-    sys.exit(1)
-
-
-def warning(msg):
-    print("ZONE %s WARNING: %s" % (zone_name, msg))
-    sys.exit(2)
-
-
-def unknown(msg):
-    print("ZONE %s UNKNOWN: %s" % (zone_name, msg))
-    sys.exit(3)
-
-
-def sanitize_name(name):
-    # Take the name and append a '.' at the end if there isn't any
-    if name[-1] == '.':
-        return name
-    else:
-        return '%s.' % name
-
-
-def IP_version(address):
-    # Return the address family
-    try:
-        socket.inet_pton(socket.AF_INET, address)
-        return 4
-    except:
-        try:
-            socket.inet_pton(socket.AF_INET6, address)
-            return 6
-        except:
-            raise AddressFamilyUnknownException(address)
-
-
-def get_addresses(name):
-    # Use the system resolver to get address info
-    global ip6
-    global ip4
-    ret = []
-    try:
-        if ip4:
-            ret += [str(x) for x in dns.resolver.query(name, 'A',
-                    raise_on_no_answer=False).rrset]
-    except:
-        pass
-
-    try:
-        if ip6:
-            ret += [str(x) for x in dns.resolver.query(name, 'AAAA',
-                    raise_on_no_answer=False).rrset]
-    except:
-        pass
-
-    return ret
-
-
-def do_query(qmsg, address, timeout=5, tries=5,
-             raise_on_bad_address_family=False):
-    global ip4
-    global ip6
-    if not ip6 and not ip4:
-        raise Exception('There is no address family available')
-
-    ip_version = IP_version(address)
-    if ip_version == 4 and not ip4:
-        if raise_on_bad_address_family:
-            raise AddressFamilyNotSupportedException
-        return False
-    if ip_version == 6 and not ip6:
-        if raise_on_bad_address_family:
-            raise AddressFamilyNotSupportedException
-        return False
-
-    for attempt in range(tries):
-        try:
-            ans = dns.query.udp(qmsg, address, timeout=timeout)
-            if debug or verbose:
-                if verbose:
-                    print('Got reply from %s' % (address))
+    def do_query_at_ip(self, qname, nameserver, tcp=False, source=None, raise_on_no_answer=True, source_port=0):
+        if isinstance(qname, (str,)):
+            qname = dns.name.from_text(qname, None)
+        rdtype = dns.rdatatype.NS
+        rdclass = dns.rdataclass.IN
+        if self.cache:
+            answer = self.cache.get((qname, rdtype, rdclass))
+            if answer is not None:
+                if answer.rrset is None and raise_on_no_answer:
+                    raise dns.resolver.NoAnswer(response=answer.response)
                 else:
-                    print('Got answer from %s: \n%s' % (address, ans))
-            return ans
-        except socket.error as error_msg:
-            # If the error is "[Errno 101] Network is unreachable", there is no
-            # ip_version connectivity, disable it for the rest of the run
-            if str(error_msg) == '[Errno 101] Network is unreachable':
-                # TODO use eval() for this
-                if ip_version == 4:
-                    if debug or verbose:
-                        print('Disabeling IPv4')
-                    ip4 = False
-                if ip_version == 6:
-                    if debug or verbose:
-                        print('Disabeling IPv6')
-                    ip6 = False
-                if raise_on_bad_address_family:
-                    raise AddressFamilyNotSupportedException
+                    return answer
+        request = dns.message.make_query(qname, rdtype, rdclass)
+        if self.keyname is not None:
+            request.use_tsig(self.keyring, self.keyname,
+                             algorithm=self.keyalgorithm)
+        request.use_edns(self.edns, self.ednsflags, self.payload)
+        request.flags = dns.flags.CD
+        response = None
+        start = time.time()
+        timeout = self._compute_timeout(start)
+        port = self.nameserver_ports.get(nameserver, self.port)
+        while response is None:
+            try:
+                tcp_attempt = tcp
+                if tcp:
+                    response = dns.query.tcp(request, nameserver,
+                                             timeout, port,
+                                             source=source,
+                                             source_port=source_port)
                 else:
-                    return False
-            else:
+                    response = dns.query.udp(request, nameserver,
+                                             timeout, port,
+                                             source=source,
+                                             source_port=source_port)
+                    if response.flags & dns.flags.TC:
+                        # Response truncated; retry with TCP.
+                        tcp_attempt = True
+                        timeout = self._compute_timeout(start)
+                        response = \
+                            dns.query.tcp(request, nameserver,
+                                          timeout, port,
+                                          source=source,
+                                          source_port=source_port)
+                        break
+            except (socket.error, dns.exception.Timeout):
                 raise
-        except dns.exception.Timeout:
-            if attempt == tries:
+            except dns.query.UnexpectedSource:
                 raise
-            time.sleep(1)
+            except dns.exception.FormError:
+                raise
+            except EOFError:
+                raise
+
+        if response is None:
+            raise dns.resolver.NoAnswer()
+
+        if response.rcode() == dns.rcode.YXDOMAIN:
+            raise dns.resolver.YXDOMAIN()
+
+        if response.rcode == dns.rcode.NXDOMAIN:
+            raise dns.resolver.NXDOMAIN(qnames=qname, responses=response)
+
+        return response
 
 
-def get_reply_type(msg):
-    # Returns the reply type of the message. Code and return values taken
-    # from ldns
-    if not isinstance(msg, dns.message.Message):
-        return 'UNKNOWN'
+class ZoneAuth(nagiosplugin.Resource):
+    def __init__(self, domain):
+        """
 
-    if msg.rcode == dns.rcode.NXDOMAIN:
-        return 'NXDOMAIN'
+        :param dns.name.Name domain:
+        """
+        self.domain = domain
+        self.resolver = CheckResolver()
 
-    if not len(msg.answer) and \
-            not len(msg.additional) and \
-            len(msg.authority) == 1:
-        if msg.authority[0].rdtype == dns.rdatatype.SOA:
-            return 'NODATA'
-
-    if not len(msg.answer) and len(msg.authority):
-        for auth_rrset in msg.authority:
-            if auth_rrset.rdtype == dns.rdatatype.NS:
-                return 'REFERRAL'
-
-    # A little sketchy, but if the message is nothing of the above,
-    # we'll label it as an answer
-    return 'ANSWER'
-
-
-def get_delegation():
-    # This function iterates from the root to the final authoritative
-    # nameservers using (where possible) the glue it gets.
-
-    # let's have the root-servers as initial glue :)
-    refs = {
-        'A.ROOT-SERVERS.NET.': ['198.41.0.4', '2001:503:BA3E::2:30'],
-        'B.ROOT-SERVERS.NET.': ['192.228.79.201', '2001:500:84::B'],
-        'C.ROOT-SERVERS.NET.': ['192.33.4.12', '2001:500:2::C'],
-        'D.ROOT-SERVERS.NET.': ['199.7.91.13', '2001:500:2D::D'],
-        'E.ROOT-SERVERS.NET.': ['192.203.230.10', '2001:500:A8::E'],
-        'F.ROOT-SERVERS.NET.': ['192.5.5.241', '2001:500:2F::F'],
-        'G.ROOT-SERVERS.NET.': ['192.112.36.4', '2001:500:12::D0D'],
-        'H.ROOT-SERVERS.NET.': ['198.97.190.53', '2001:500:1::53'],
-        'I.ROOT-SERVERS.NET.': ['192.36.148.17', '2001:7FE::53'],
-        'J.ROOT-SERVERS.NET.': ['192.58.128.30', '2001:503:C27::2:30'],
-        'K.ROOT-SERVERS.NET.': ['193.0.14.129', '2001:7FD::1'],
-        'L.ROOT-SERVERS.NET.': ['199.7.83.42', '2001:500:9F::42'],
-        'M.ROOT-SERVERS.NET.': ['202.12.27.33', '2001:DC3::35']
-    }
-
-    qmsg = dns.message.make_query(zone_name, dns.rdatatype.SOA)
-    qmsg.flags = 0
-
-    if debug or verbose:
-        print('Starting to iterate to get the delegation')
-
-    while True:
-        ans_pkt = None
-        ref_list = random.sample(refs, len(refs))
-
-        for ref in ref_list:
-            if refs[ref] == []:
-                # No referral additional data was sent, do a forward lookup
-                # using the system resolver
-                refs[ref] = get_addresses(ref)
-            for addr in refs[ref]:
-                if debug or verbose:
-                    print('Selected %s(%s) for query' % (ref, addr))
-                ans_pkt = do_query(qmsg, addr)
-                if ans_pkt:
-                    break
-            if ans_pkt:
+    def probe(self):
+        _log.info('Trying to get Parent NSes for {}'.format(self.domain))
+        parent_nameservers = self.resolver.get_parent_ns(self.domain)
+        _log.debug('Got response'.format(parent_nameservers))
+        authority_ns_from_parent = []
+        for nameserver in parent_nameservers:
+            addresses = self.resolver.get_addrs(nameserver)
+            if addresses:
+                for add_type, values in addresses.items():
+                    for address in values:
+                        try:
+                            authority_ns_from_parent = self.resolver.get_delegation_ns_from(self.domain, address)
+                            if authority_ns_from_parent:
+                                break
+                        except Exception as e:
+                            pass
+            if authority_ns_from_parent:
                 break
 
-        # Check if the answer-packet is
-        # a referral, an answer or NODATA
-        reply_type = get_reply_type(ans_pkt)
-        if debug or verbose:
-            print('Got a %s reply' % reply_type)
-        if reply_type == 'REFERRAL':
-            # We got a referral from the upstream nameserver
-            final_ref = False
-            refs = {}
-            for rrset in ans_pkt.authority:
-                if rrset.rdtype == dns.rdatatype.NS:
-                    for ns in rrset:
-                        refs[str(ns)] = []
-                    if str(rrset.name) == zone_name:
-                        if debug or verbose:
-                            print('- This is the final referral')
-                        final_ref = True
-            for rrset in ans_pkt.additional:
-                # hopefully we got some glue :)
-                if rrset.rdtype == dns.rdatatype.AAAA or \
-                        rrset.rdtype == dns.rdatatype.A:
-                    for glue in rrset:
-                        refs[str(rrset.name)].append(str(glue))
-            if debug or verbose:
-                print('Got the following referrals:\n%s' % refs)
+        if not authority_ns_from_parent:
+            raise nagiosplugin.CheckError('Unable to retrieve nameservers for {} from parent'.format(self.domain))
 
-            if final_ref:
-                for ref in refs:
-                    if refs[ref] == []:
-                        refs[ref] = get_addresses(ref)
-                return refs
+        authority_ns_from_auth = {}
 
-            if len(refs):
-                # Go to the next iteration
-                continue
-            else:
-                unknown('Got a referral without glue')
+        for nameserver in authority_ns_from_parent:
+            addresses = self.resolver.get_addrs(nameserver)
+            if not addresses:
+                raise nagiosplugin.CheckError('No addresses exist for authoritative nameserver {}'.format(nameserver))
 
-        elif reply_type == 'ANSWER':
-            # we reached the correct nameserver. This happens when the
-            # nameserver for example.com is also authoritative for
-            # sub.example.com and .com has send us a referral to example.com
-            # So return the refs from the 'previous' iteration
-            return refs
+            for add_type, values in addresses.items():
+                for address in values:
+                    try:
+                        authority_ns_from_auth[nameserver] = self.resolver.get_ns_from(self.domain, address)
+                    except Exception as e:
+                        pass
 
-        elif reply_type == 'NODATA':
-            # zonename is most-likely not a zone
-            return {}
+        yield nagiosplugin.Metric('parent_delegation', set(authority_ns_from_parent), context='parent delegation')
+
+        to_yield = {'auth_nssets': {}, 'parent_nsset': set(authority_ns_from_parent)}
+        for nameserver, auth_nsset in authority_ns_from_auth.items():
+            tmp = {nameserver: set(auth_nsset)}
+            to_yield['auth_nssets'].update(tmp)
+        yield nagiosplugin.Metric('auth_nssets', to_yield, context='zone auth')
 
 
-def is_same(items, field=False):
-    # Returns true if all items are the same
-    return all(x == items[0] for x in items)
+class ParentDelegationContext(nagiosplugin.context.Context):
+    def __init__(self, name, expected_servers=None,
+                 fmt_metric=None, result_cls=nagiosplugin.Result):
+        super(ParentDelegationContext, self).__init__(name, fmt_metric, result_cls)
+        self.expected_servers = expected_servers
+
+    def evaluate(self, metric, resource):
+        """
+
+        :param nagiosplugin.Metric metric:
+        :param resource:
+        :return:
+        """
+        if self.expected_servers:
+            if metric.value != self.expected_servers:
+                expected_str = ','.join([str(x) for x in self.expected_servers])
+                delegation_str = ','.join([str(x) for x in metric.value])
+                return nagiosplugin.Result(nagiosplugin.Critical,
+                                           'Parent delegation does match expected NSSet: "{}" vs "{}"'.format(
+                                               delegation_str,
+                                               expected_str
+                                           ),
+                                           metric)
+        return nagiosplugin.Result(nagiosplugin.Ok, '', metric)
 
 
-def check_delegation(data, from_upstream, expected_ns_list=None):
-    # Various checks to see if the delegation is correct
-    name_list = []
-    addr_list = []
-    soa_rec_list = []
-    soa_serial_list = []
-    soa_ns_list = []
-    ns_rec_list = []
+class ZoneAuthContext(nagiosplugin.context.Context):
+    def __init__(self, name, expected_servers=None,
+                 fmt_metric=None, result_cls=nagiosplugin.Result):
+        super(ZoneAuthContext, self).__init__(name, fmt_metric, result_cls)
+        self.expected_servers = expected_servers
 
-    # Fill the lists with all the data we need to compare them later on
-    for nameserver in data:
-        for addr in data[nameserver]:
-            name_list.append(nameserver)
-            addr_list.append(addr)
+    def evaluate(self, metric, resource):
+        """
 
-            for answer in data[nameserver][addr]['SOA'].answer:
-                if answer.rdtype == dns.rdatatype.SOA:
-                    if not str(answer.name) == zone_name:
-                        critical("Name on SOA record returned by %s on %s is"
-                                 "not the zone name (%s vs %s)" %
-                                 (nameserver, addr, answer.name, zone_name))
-                    soa_rec_list.append(answer)
-                    soa_serial_list.append(answer.to_text().split(' ')[6])
-                    soa_ns_list.append(answer.to_text().split(' ')[4])
+        :param nagiosplugin.Metric metric:
+        :param resource:
+        :return:
+        """
+        parent_nsset_str = ','.join([str(x) for x in metric.value.get('parent_nsset')])
+        expected_str = ','.join([str(x) for x in self.expected_servers])
+        if self.expected_servers:
+            for auth, nsset in metric.value.get('auth_nssets').items():
+                nsset_str = ','.join([str(x) for x in nsset])
+                if nsset != self.expected_servers:
+                    if self.expected_servers.isdisjoint(nsset):
+                        return nagiosplugin.Result(nagiosplugin.Critical,
+                                                   '{}: NSSet does not match expected: "{}" vs "{}"'.format(
+                                                       auth,
+                                                       nsset_str,
+                                                       expected_str
+                                                   ),
+                                                   metric)
+                    return nagiosplugin.Result(nagiosplugin.Warn,
+                                               '{}: NSSet does not fully match expected: "{}" vs "{}"'.format(
+                                                   auth,
+                                                   nsset_str,
+                                                   expected_str
+                                               ),
+                                               metric)
 
-            for answer in data[nameserver][addr]['NS'].answer:
-                if answer.rdtype == dns.rdatatype.NS:
-                    if not str(answer.name) == zone_name:
-                        critical("Name on NS record returned by %s on %s is"
-                                 "not the zone name (%s vs %s)" %
-                                 (nameserver, addr, answer.name, zone_name)
-                                 )
-                    ns_recs = sorted(
-                        [ns.split(' ')[4] for
-                            ns in [rdata for
-                                   rdata in answer.to_text().split("\n")]
-                         ])
-                    ns_rec_list.append(ns_recs)
-                    if expected_ns_list:
-                        if ns_recs != sorted(expected_ns_list):
-                            critical('Got unexpected NS records, expected %s,'
-                                     ' got %s from %s at %s' %
-                                     (','.join(sorted(expected_ns_list)),
-                                      ','.join(sorted(ns_recs)),
-                                      nameserver, addr))
+        for auth, nsset in metric.value.get('auth_nssets').items():
+            nsset_str = ','.join([str(x) for x in nsset])
+            if metric.value.get('parent_nsset') != nsset:
+                if metric.value.get('parent_nsset').isdisjoint(nsset):
+                    return nagiosplugin.Result(nagiosplugin.Critical,
+                                               '{}: NSSet does not match parent NSSet: "{}" vs "{}"'.format(
+                                                   auth, nsset_str, parent_nsset_str
+                                               ),
+                                               metric)
+                return nagiosplugin.Result(nagiosplugin.Warn,
+                                           '{}: NSSet does not fully match parent NSSet: "{}" vs "{}"'.format(
+                                               auth, nsset_str, parent_nsset_str
+                                           ),
+                                           metric)
 
-            ns_dict = {}
-            for addition in data[nameserver][addr]['NS'].additional:
-                if str(addition.name) not in ns_dict:
-                    ns_dict[str(addition.name)] = []
-
-                for addition_address in [rdata.split(' ')[4] for rdata in
-                                         addition.to_text().split('\n')]:
-                    ns_dict[str(addition.name)].append(addition_address)
-
-            if sorted(from_upstream) != sorted(ns_dict):
-                warning('Addresses of nameservers on %s(%s) don\'t match'
-                        'upstream glue (%s vs %s)' %
-                        (nameserver, addr, from_upstream, ns_dict))
-
-    if not is_same(soa_serial_list):
-        warning('serials in SOA don\'t match. Got %s' % ', '.join(['%s (%s):'
-                '%s' % (name_list[i], addr_list[i], soa_serial_list[i])
-                for i in range(len(name_list))]))
-
-    if not is_same(soa_ns_list):
-        warning('primary nameservers in SOA don\'t match. Got %s' %
-                ', '.join(['%s (%s): %s' % (name_list[i],
-                                            addr_list[i], soa_ns_list[i]) for
-                          i in range(len(name_list))]))
-
-    if not is_same(ns_rec_list):
-        warning('Mis-matched NS records. Got %s' % ', '.join(['%s (%s): %s'
-                % (name_list[i], addr_list[i], ns_rec_list[i]) for i in
-                range(len(name_list))]))
-
-    # If we're here, we got the correct nameservers.
-    ok('got %s as nameservers' % ','.join(sorted(ns_rec_list[0])))
+        return nagiosplugin.Result(nagiosplugin.Ok, '', metric)
 
 
-def get_auth_data(rdtype, address):
-    msg = dns.message.make_query(zone_name, eval('dns.rdatatype.%s' % rdtype))
-    msg.flags = 0
+class ZoneAuthSummary(nagiosplugin.Summary):
+    def make_summary_for_result(self, result):
+        if result.metric.context == 'parent delegation':
+            return 'Parent NSSet: {}'.format(','.join([str(x) for x in result.metric.value]))
+        elif result.metric.context == 'zone auth':
+            ret = []
+            for auth, nsset in result.metric.value.get('auth_nssets').items():
+                ret.append('{} NSSet: {}'.format(auth, ','.join([str(x) for x in nsset])))
+            return ', '.join(ret)
 
-    ret = do_query(msg, address, raise_on_bad_address_family=True)
+    def problem(self, results):
+        """
 
-    if 'AA' not in dns.flags.to_text(ret.flags):
-        raise NotAuthAnswerException([rdtype, address])
+        :param nagiosplugins.result.Results results:
+        :return:
+        """
+        ret_hints = []
+        ret = []
+        for result in results.most_significant:
+            ret_hints.append(result.hint)
+            ret.append(self.make_summary_for_result(result))
+        return '{}! {}'.format(', '.join(ret_hints), ' ; '.join(ret))
 
-    if get_reply_type(ret) != 'ANSWER':
-        raise NoAnswerException([rdtype, address])
+    def ok(self, results):
+        ret = []
+        for result in results:
+            ret.append(self.make_summary_for_result(result))
+        return ' ; '.join(ret)
 
-    return ret
+
+@nagiosplugin.guarded
+def main():
+    parser = argparse.ArgumentParser(description='Check for delegation and '
+                                                 'zone-consistency')
+    parser.add_argument('zone', help='Zone to check', metavar='ZONE')
+    #    group = parser.add_mutually_exclusive_group()
+    #    group.add_argument('-6', action='store_true', dest='ip6_only')
+    #    group.add_argument('-4', action='store_true', dest='ip4_only')
+    parser.add_argument('--nameservers', '-n', help='A comma-separated list of '
+                                                    'expected nameservers')
+    parser.add_argument('--verbose', '-v', help='Be a little verbose',
+                        action='count', default=0)
+    # parser.add_argument('--dnssec', action='store_true', help='Also check DNSSEC')
+    args = parser.parse_args()
+
+    zone_name = dns.name.from_text(args.zone)
+
+    #    ip4 = True
+    #    ip6 = True
+    #
+    #    if args.ip4_only:
+    #        ip6 = False
+    #    if args.ip6_only:
+    #        ip4 = False
+
+    expected = set()
+    if args.nameservers:
+        expected = set([dns.name.Name(x.split('.')).derelativize(dns.name.root) for x in args.nameservers.split(',')])
+
+    check = nagiosplugin.Check(
+        ZoneAuth(domain=zone_name),
+        ZoneAuthContext('zone auth', expected_servers=expected),
+        ParentDelegationContext('parent delegation', expected_servers=expected),
+        ZoneAuthSummary()
+    )
+
+    check.main(verbose=args.verbose)
 
 
-def get_info_from_nameservers(refs):
-    ret_data = {}
-
-    for ns in refs:
-        ret_data[ns] = {}
-        for address in refs[ns]:
-            if IP_version(address) == 4 and not ip4:
-                continue
-            if IP_version(address) == 6 and not ip6:
-                continue
-
-            if debug or verbose:
-                print('Getting SOA and NS info from %s on %s' % (ns, address))
-
-            ret_data[ns][address] = {}
-            try:
-                ret_data[ns][address]['SOA'] = get_auth_data('SOA', address)
-                ret_data[ns][address]['NS'] = get_auth_data('NS', address)
-            except NotAuthAnswerException as e:
-                critical('Got non-AA answer for %s from %s(%s)' % (e[0][0], ns,
-                         address))
-            except NoAnswerException as e:
-                unknown('No %s records returned from %s(%s)' % (e[0], ns,
-                        address))
-            except AddressFamilyNotSupportedException:
-                # Remove this entry from the dict, as we can never get the data
-                del ret_data[ns][address]
-                continue
-
-        if ret_data[ns] == {}:
-            del ret_data[ns]
-
-    return ret_data
-
-parser = argparse.ArgumentParser(description='Check for delegation and '
-                                             'zone-consistancy')
-parser.add_argument('zone', help='Zone to check', metavar='ZONE')
-parser.add_argument('-6', action='store_true', dest='ip6_only')
-parser.add_argument('-4', action='store_true', dest='ip4_only')
-parser.add_argument('--nameservers', '-n', help='A comma-separated list of '
-                                                'expected nameservers')
-parser.add_argument('--verbose', '-v', help='Be a little verbose',
-                    action='store_true')
-parser.add_argument('--debug', '-d', help='Output debugging information',
-                    action='store_true')
-args = parser.parse_args()
-
-zone_name = sanitize_name(args.zone)
-debug = args.debug
-verbose = args.verbose
-
-if args.ip4_only and args.ip6_only:
-    unknown("Please use either -4, -6 or none, not both")
-
-ip4 = True
-ip6 = True
-
-if args.ip4_only:
-    ip6 = False
-if args.ip6_only:
-    ip4 = False
-
-if args.nameservers:
-    expected = [sanitize_name(x) for x in args.nameservers.split(',')]
-else:
-    expected = False
-
-from_upstream = get_delegation()
-if len(from_upstream):
-    if len(from_upstream) == 1:
-        # Only one auth is delegated... that is not the right way
-        warning('only one authoritative nameserver from upstream: %s' %
-                from_upstream.keys())
-    # We got referrals
-    if expected:
-        if not sorted(from_upstream.keys()) == sorted(expected):
-            critical('Got unexpected nameservers from upstream: expected %s, '
-                     'got %s' % (', '.join(sorted(expected)),
-                                 ', '.join(from_upstream.keys())))
-
-    data = get_info_from_nameservers(from_upstream)
-    check_delegation(data, from_upstream, expected)
-
-else:
-    unknown("No nameservers found, is %s a zone?" % zone_name)
-
-# TODO
-# - Write tests
-# - TCP fallback + EDNS buffers
-# - DNSSEC support
+if __name__ == '__main__':
+    main()
